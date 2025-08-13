@@ -23,6 +23,9 @@ env/
 # 📄 README personnels
 zdoc_marketlounge/README*.md
 
+# 🛠️ Scripts utilitaires locaux
+zscripts_utilitaires/
+
 # 🐳 Docker
 *.npy
 *.db
