@@ -20,6 +20,9 @@ ENV/
 env/
 .venv/
 
+# 📄 README personnels
+zdoc_marketlounge/README*.md
+
 # 🐳 Docker
 *.npy
 *.db
