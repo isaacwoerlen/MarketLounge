@@ -1,23 +1,24 @@
-version: "3.9"
-
 services:
   web:
     build: .
     restart: unless-stopped
-    command: >
-      sh -c "python manage.py makemigrations &&
-             python manage.py migrate &&
-             gunicorn config.wsgi:application --bind 0.0.0.0:8000"
+    command: gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3
     volumes:
       - .:/app
       - static_volume:/app/staticfiles
+      - logs_volume:/app/logs
     expose:
       - "8000"
     env_file:
       - .env
     depends_on:
       - db
-      - faiss
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   db:
     image: postgres:15
@@ -28,14 +29,59 @@ services:
       POSTGRES_DB: marketlounge_db
       POSTGRES_USER: Isaac
       POSTGRES_PASSWORD: 3410
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U Isaac"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:6
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  celery:
+    build: .
+    restart: unless-stopped
+    command: celery -A marketlounge.celery_app worker -l info
+    volumes:
+      - .:/app
+      - logs_volume:/app/logs
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - db
+
+  celery-beat:
+    build: .
+    restart: unless-stopped
+    command: celery -A marketlounge.celery_app beat -l info
+    volumes:
+      - .:/app
+      - logs_volume:/app/logs
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - db
 
   faiss:
     image: python:3.10-slim
     restart: unless-stopped
     volumes:
       - ./faiss_index:/app/faiss_index
+      - logs_volume:/app/logs
     working_dir: /app
     command: sleep infinity
+    env_file:
+      - .env
 
   nginx:
     image: nginx:latest
@@ -51,3 +97,5 @@ services:
 volumes:
   pgdata:
   static_volume:
+  redis_data:
+  logs_volume:

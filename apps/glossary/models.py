@@ -1,10 +1,20 @@
 # apps/glossary/models.py
+from __future__ import annotations
+
 import uuid
-from django.db import models
-from django.core.exceptions import ValidationError
-from django.utils.text import slugify
+from typing import Optional, Set
+
 from django.conf import settings
-from django.utils import timezone
+from django.contrib.postgres.indexes import GinIndex
+from django.core.exceptions import ValidationError
+from django.db import models
+from django.utils.text import slugify
+from django.db import migrations
+
+
+# Langues couvertes pour la concat de recherche (ajuste si besoin)
+SEARCH_LANGS = ("fr", "en", "de", "it")
+
 
 class GlossaryType(models.TextChoices):
     METIER = "metier", "Métier"
@@ -14,150 +24,223 @@ class GlossaryType(models.TextChoices):
 
 class GlossaryNode(models.Model):
     """
-    Source de vérité unique (Glossaire)
-    - glossary_id : identifiant canonique (stable, unique, indexé)
-    - node_id     : slug UX lisible (non unique, indexé) → chemins/URLs
-    - parent      : FK sur glossary_id du parent (contexte métier strict)
-    - labels/definition/procede/explication_technique/seo : JSON multilingue
-    - embedding   : JSON (phase 1), migrable vers pgvector plus tard
+    Nœud de Glossaire gouverné (Pilier 1) :
+    - Identifiant canonique: glossary_id (unique)
+    - Slug UX: node_id (lisible, non unique globalement)
+    - Hiérarchie: parent → FK vers 'glossary_id' (db_column = parent_glossary_id)
+    - Chemin: path (dérivé, indexé)
+    - Contenu: labels/definition/procede/explication_technique/seo (JSONB)
+    - Gouvernance: version, is_active, created_by/reviewed_by, alerts
+    - Performance: search_text (trigram), indexes GIN sur JSONB
     """
 
     # Identifiants
-    glossary_id = models.CharField(max_length=64, unique=True, db_index=True)
-    node_id = models.SlugField(max_length=128, unique=False, db_index=True)
+    glossary_id = models.CharField(max_length=100, unique=True, db_index=True)
+    node_id = models.CharField(max_length=100, db_index=True)
 
     # Typage
-    type = models.CharField(max_length=16, choices=GlossaryType.choices)
+    type = models.CharField(max_length=20, choices=GlossaryType.choices, db_index=True)
 
-    # Parent par ID canonique (glossary_id)
+    # Arborescence (FK via 'glossary_id' pour des URLs/API stables)
     parent = models.ForeignKey(
         "self",
         to_field="glossary_id",
         db_column="parent_glossary_id",
+        related_name="children",
         null=True,
         blank=True,
-        on_delete=models.SET_NULL,
-        related_name="children",
+        on_delete=models.PROTECT,  # évite la suppression accidentelle d'une branche
     )
 
-    # Contexte (non identifiant)
-    path = models.CharField(max_length=512, db_index=True)
+    # Chemin dérivé (ex: forge/forge_libre/marteau_pilon)
+    path = models.CharField(max_length=255, db_index=True)
 
-    # Contenus multilingues (FR/EN requis; DE/IT faciles à ajouter)
-    labels = models.JSONField(default=dict, blank=True)                   # {"fr": "...", "en": "...", "de": "...", ...}
-    definition = models.JSONField(default=dict, blank=True)               # (metier, operation)
-    procede = models.JSONField(default=dict, blank=True)                  # (operation)
-    explication_technique = models.JSONField(default=dict, blank=True)    # (variante)
-    seo = models.JSONField(default=dict, blank=True)                      # {"fr": {"keywords":[...], "description":"..."}}
+    # Champs JSONB multilingues
+    labels = models.JSONField(default=dict, blank=True)  # {"fr": "...", "en": "...", ...}
+    definition = models.JSONField(default=dict, blank=True)
+    procede = models.JSONField(default=dict, blank=True)
+    explication_technique = models.JSONField(default=dict, blank=True)
+    seo = models.JSONField(default=dict, blank=True)  # {"fr": {"keywords": [...], "description": "..."}}
 
-    # Embedding par nœud (phase 1)
+    # Embedding (optionnel) et alerts (liste d’objets)
     embedding = models.JSONField(null=True, blank=True)
+    alerts = models.JSONField(default=list, blank=True)  # ex: [{"type":"duplicate","detail":"..."}]
 
-    # Gouvernance légère
-    is_active = models.BooleanField(default=True)
-    version = models.PositiveIntegerField(default=1)
-    alerts = models.JSONField(null=True, blank=True)  # ex: [{"type":"duplicate_node_id","detail":"..."}]
+    # Recherche plein-texte légère (trigram sur un concat labels/keywords)
+    search_text = models.TextField(blank=True, default="")
 
-    # Trace
-    created_at = models.DateTimeField(default=timezone.now)
-    updated_at = models.DateTimeField(auto_now=True)
+    # Gouvernance & timestamps
+    is_active = models.BooleanField(default=False)
+    version = models.IntegerField(default=1)
     created_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, null=True, blank=True,
-        on_delete=models.SET_NULL, related_name="+"
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     reviewed_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, null=True, blank=True,
-        on_delete=models.SET_NULL, related_name="+"
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True, db_index=True)
+
+    # ---------- Validation métier (Pilier 1) ----------
+
+    def clean(self):
+        """
+        Règles clés :
+        - Métier : pas de parent
+        - Opération : parent obligatoire et de type Métier
+        - Variante : parent obligatoire et de type Opération
+        - Anti-cycle dans l’arbre
+        - Publication stricte : interdit is_active=True sans revue
+        """
+        t = self.type
+
+        # Parentage de base
+        if t == GlossaryType.METIER and self.parent is not None:
+            raise ValidationError("Un 'métier' ne doit pas avoir de parent.")
+        if t == GlossaryType.OPERATION and self.parent is None:
+            raise ValidationError("Une 'opération' doit avoir un parent de type 'métier'.")
+        if t == GlossaryType.VARIANTE and self.parent is None:
+            raise ValidationError("Une 'variante' doit avoir un parent de type 'opération'.")
+
+        # Typage du parent (si présent)
+        if self.parent:
+            if t == GlossaryType.OPERATION and self.parent.type != GlossaryType.METIER:
+                raise ValidationError("Le parent d'une 'opération' doit être un 'métier'.")
+            if t == GlossaryType.VARIANTE and self.parent.type != GlossaryType.OPERATION:
+                raise ValidationError("Le parent d'une 'variante' doit être une 'opération'.")
+
+        # Anti-cycle (remonte les ancêtres par glossary_id)
+        if self.parent:
+            seen: Set[str] = set()
+            cursor: Optional[GlossaryNode] = self.parent
+            while cursor:
+                if cursor.glossary_id in seen:
+                    raise ValidationError("Cycle détecté dans l'arborescence du glossaire.")
+                seen.add(cursor.glossary_id)
+                if cursor == self:
+                    raise ValidationError("Un nœud ne peut pas être son propre ancêtre.")
+                cursor = cursor.parent
+
+        # Gouvernance : publication stricte
+        if self.is_active:
+            if self.reviewed_by is None or (self.version or 0) < 2:
+                raise ValidationError(
+                    "Publication interdite sans validation humaine : 'reviewed_by' requis et version >= 2."
+                )
+
+    # ---------- Sauvegarde (normalisation + path + search_text) ----------
+
+    def save(self, *args, **kwargs):
+        """
+        - Génère/normalise node_id (slug) à partir du label FR/EN ou de glossary_id
+        - Recalcule path à partir du parent (ou node_id si racine)
+        - Initialise les JSONB manquants
+        - Construit search_text (labels + keywords SEO) pour index trigram
+        - Place un alert IA minimal si création 'bot' sans labels
+        """
+        if not self.glossary_id:
+            self.glossary_id = f"{self.type}_{str(uuid.uuid4())[:8]}"
+        super().save(*args, **kwargs)
+       
+        # 1) node_id lisible & stable
+        base_label = None
+        if isinstance(self.labels, dict):
+            base_label = self.labels.get("fr") or self.labels.get("en")
+        self.node_id = slugify(self.node_id or base_label or self.glossary_id or str(uuid.uuid4()))
+
+        # 2) path hiérarchique
+        if self.parent:
+            parent_path = getattr(self.parent, "_cached_path", None) or self.parent.path or self.parent.node_id
+            self.path = f"{parent_path}/{self.node_id}"
+        else:
+            self.path = self.node_id
+
+        # 3) JSONB par défaut
+        if self.labels is None:
+            self.labels = {}
+        if self.definition is None:
+            self.definition = {}
+        if self.procede is None:
+            self.procede = {}
+        if self.explication_technique is None:
+            self.explication_technique = {}
+        if self.seo is None:
+            self.seo = {}
+        if self.alerts is None:
+            self.alerts = []
+
+        # 4) search_text (labels + seo.keywords FR/EN…)
+        def _kw(lang: str) -> str:
+            v = (self.seo or {}).get(lang, {})
+            if isinstance(v, dict):
+                kws = v.get("keywords") or []
+                if isinstance(kws, (list, tuple)):
+                    return " ".join([str(x) for x in kws])
+                return str(kws)
+            return ""
+        buckets = []
+        for lang in SEARCH_LANGS:
+            buckets.append((self.labels or {}).get(lang, ""))
+            buckets.append(_kw(lang))
+        self.search_text = " ".join([b for b in buckets if b]).strip()
+
+        # 5) petit signal IA si création par bot et contenu vide
+        if getattr(self, "created_by", None) and not self.labels:
+            self.alerts = (self.alerts or []) + [{"type": "ia_pending", "detail": "Labels à générer via IA"}]
+
+        super().save(*args, **kwargs)
+
+        # cache local optionnel pour chaines de sauvegarde (non persistant)
+        self._cached_path = self.path
+
+    # ---------- Aides & représentation ----------
+
+    @property
+    def parent_glossary_id(self) -> Optional[str]:
+        return self.parent.glossary_id if self.parent else None
+
+    @property
+    def depth(self) -> int:
+        # profondeur simple dérivée du path
+        return self.path.count("/") + 1 if self.path else 0
+
+    def __str__(self) -> str:
+        return f"[{self.type}] {self.glossary_id} → {self.path}"
 
     class Meta:
+        verbose_name = "Nœud du Glossaire"
+        verbose_name_plural = "Nœuds du Glossaire"
+        # Unicité “fratrie”: même parent → node_id unique (sécurise la structure)
+        constraints = [
+            models.UniqueConstraint(fields=["parent", "node_id"], name="uq_gloss_parent_node"),
+        ]
         indexes = [
+            models.Index(fields=['glossary_id']),
             models.Index(fields=["type"]),
             models.Index(fields=["path"]),
             models.Index(fields=["node_id"]),
+            # Indexe la FK parent pour des listes enfants instantanées
+            models.Index(fields=["parent"]),
+            # JSONB GIN pour __contains & co
+            GinIndex(fields=["labels"], name="gloss_labels_gin"),
+            GinIndex(fields=["definition"], name="gloss_definition_gin"),
+            GinIndex(fields=["procede"], name="gloss_procede_gin"),
+            GinIndex(fields=["explication_technique"], name="gloss_exptech_gin"),
+            GinIndex(fields=["seo"], name="gloss_seo_gin"),
+            GinIndex(fields=["alerts"], name="gloss_alerts_gin"),
+            # Trigram pour icontains sur search_text (nécessite l’extension pg_trgm)
+            GinIndex(fields=["search_text"], name="gloss_search_trgm", opclasses=["gin_trgm_ops"]),
+            # Aide aux exports: actifs récents
+            models.Index(fields=["is_active", "version"], name="idx_active_version"),
+            models.Index(fields=["created_at"]),
+            models.Index(fields=["updated_at"]),
         ]
-        ordering = ["type", "glossary_id"]
 
-    # ───────── Validations métier ─────────
-    def clean(self):
-        if not self.node_id:
-            raise ValidationError("node_id est requis (slug snake_case).")
-
-        # Règles parentales
-        if self.type == GlossaryType.METIER:
-            if self.parent is not None:
-                raise ValidationError("Un 'metier' ne doit pas avoir de parent.")
-        elif self.type == GlossaryType.OPERATION:
-            if not self.parent or self.parent.type != GlossaryType.METIER:
-                raise ValidationError("Le parent d'une 'operation' doit être un 'metier'.")
-        elif self.type == GlossaryType.VARIANTE:
-            if not self.parent or self.parent.type != GlossaryType.OPERATION:
-                raise ValidationError("Le parent d'une 'variante' doit être une 'operation'.")
-
-        # Contenus requis/interdits par type
-        if self.type == GlossaryType.METIER:
-            if self._has_nonempty(self.procede):
-                raise ValidationError("Un 'metier' ne doit pas définir 'procede'.")
-            if self._has_nonempty(self.explication_technique):
-                raise ValidationError("Un 'metier' ne doit pas définir 'explication_technique'.")
-        if self.type == GlossaryType.OPERATION:
-            if not self._has_nonempty(self.definition):
-                raise ValidationError("Une 'operation' doit avoir une 'definition'.")
-            if not self._has_nonempty(self.procede):
-                raise ValidationError("Une 'operation' doit avoir un 'procede'.")
-            if self._has_nonempty(self.explication_technique):
-                raise ValidationError("Une 'operation' ne doit pas définir 'explication_technique'.")
-        if self.type == GlossaryType.VARIANTE:
-            if not self._has_nonempty(self.explication_technique):
-                raise ValidationError("Une 'variante' doit avoir une 'explication_technique'.")
-            if self._has_nonempty(self.definition):
-                raise ValidationError("Une 'variante' ne doit pas définir 'definition'.")
-            if self._has_nonempty(self.procede):
-                raise ValidationError("Une 'variante' ne doit pas définir 'procede'.")
-
-        # Anti‑cycle
-        if self.parent:
-            seen = {self.glossary_id}
-            p = self.parent
-            while p:
-                if p.glossary_id in seen:
-                    raise ValidationError("Cycle détecté dans la relation parent.")
-                seen.add(p.glossary_id)
-                p = p.parent
-
-        # Multilingue minimal requis
-        for lang in ("fr", "en"):
-            if not (self.labels or {}).get(lang):
-                raise ValidationError(f"labels.{lang} est requis.")
-
-        # SEO structure propre
-        if self.seo:
-            for lang, obj in self.seo.items():
-                if not isinstance(obj, dict):
-                    raise ValidationError(f"seo.{lang} doit être un objet.")
-                if "keywords" in obj and not isinstance(obj["keywords"], list):
-                    raise ValidationError(f"seo.{lang}.keywords doit être une liste.")
-
-    # ───────── Persistance ─────────
-    def save(self, *args, **kwargs):
-        # Normalise le slug UX
-        self.node_id = slugify(self.node_id or (self.labels or {}).get("fr") or self.glossary_id or str(uuid.uuid4()))
-        # Recalcule le path
-        if self.parent:
-            base = self.parent.path or self.parent.node_id
-            self.path = f"{base}/{self.node_id}"
-        else:
-            self.path = self.node_id
-        # Initialise les JSON manquants
-        for key in ("labels", "definition", "procede", "explication_technique", "seo"):
-            if getattr(self, key) is None:
-                setattr(self, key, {})
-        super().save(*args, **kwargs)
-
-    # ───────── Utils ─────────
-    @staticmethod
-    def _has_nonempty(dct: dict) -> bool:
-        return bool(dct) and any(bool(v) for v in dct.values())
-
-    def __str__(self):
-        return f"{self.glossary_id} / {self.node_id} [{self.type}]"
+    # Migration pour pg_trgm
+    class Migration(migrations.Migration):
+        dependencies = [
+            ('glossary', 'previous_migration'),  # Remplacer par votre dernière migration
+        ]
+        operations = [
+            migrations.RunSQL("CREATE EXTENSION IF NOT EXISTS pg_trgm;"),
+        ]
