@@ -1,0 +1,68 @@
+# 🔐 Secrets
+.env
+.env.*
+
+# 🐍 Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.log
+
+# 📦 Virtualenv
+venv/
+ENV/
+env/
+.venv/
+
+# 🐳 Docker
+*.npy
+*.db
+*.sqlite3
+*.pid
+*.sock
+*.gz
+*.tar
+*.tgz
+*.bak
+*.tmp
+*.swp
+*.lock
+
+# 🧪 Tests
+.coverage
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+*.test.py
+
+# 🧠 FAISS index
+faiss_index/
+*.npy
+
+# 📄 Django
+db.sqlite3
+media/
+staticfiles/
+static/
+local_settings.py
+
+# 🧰 VSCode / IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# 📦 Node (si tu ajoutes Tailwind via npm plus tard)
+node_modules/
+package-lock.json
+yarn.lock
+
+# 📁 OS
+.DS_Store
+Thumbs.db
