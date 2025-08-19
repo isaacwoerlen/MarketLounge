@@ -1,0 +1,223 @@
+# apps/transversales/language/services.py
+from __future__ import annotations
+import hashlib
+import re  # Ajout pour placeholders
+from typing import Dict, List, Optional, Union, Iterable
+import numpy as np
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.db.models import Max
+
+from apps.language.models import Language, TranslatableKey, Translation
+
+# Config lean
+SEO_MAXLEN = getattr(settings, "LANG_SEO_MAXLEN", 160)
+BATCH_SIZE = getattr(settings, "LANG_BATCH_SIZE", 200)
+EMBED_SYNC = getattr(settings, "LANG_EMBED_SYNC", True)
+
+# Helpers
+def compute_checksum(text: str) -> str:
+    """Calcule un hash SHA256 du contenu source."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+def validate_seo_lengths(text: str, source_text: str, field: str = "text", max_length: int = SEO_MAXLEN) -> List[Dict[str, str]]:
+    """Vérifie la longueur SEO et les placeholders."""
+    alerts: List[Dict[str, str]] = []
+    if text and len(text) > max_length:
+        alerts.append({"type": "seo_length", "field": field, "message": f"Text too long ({len(text)} chars)"})
+    # Placeholder validation
+    src_ph = set(re.findall(r"\{\{.*?\}\}|\{[a-zA-Z0-9_]+\}|%\w|\$\w+", source_text or ""))
+    tgt_ph = set(re.findall(r"\{\{.*?\}\}|\{[a-zA-Z0-9_]+\}|%\w|\$\w+", text or ""))
+    missing = src_ph - tgt_ph
+    if missing:
+        alerts.append({"type": "placeholder_mismatch", "message": f"Missing: {sorted(missing)}"})
+    return alerts
+
+def get_active_language(code: str) -> Language:
+    """Récupère une langue active avec normalisation."""
+    code_n = code.strip().lower().replace("_", "-")
+    lang = Language.objects.filter(code=code_n, is_active=True).first()
+    if not lang:
+        raise ValidationError(f"Language '{code}' not found or inactive.")
+    return lang
+
+def _get_source_text(key: TranslatableKey, source_lang: Language) -> Optional[str]:
+    """Récupère le texte source (dernière Translation dans source_lang)."""
+    tr = Translation.objects.filter(key=key, language=source_lang).order_by("-version").first()
+    return tr.text if tr else None
+
+def tm_lookup(key_id: int, source_checksum: str, target_lang: str) -> Optional[str]:
+    """Recherche un match exact dans Translation Memory."""
+    tr = Translation.objects.filter(
+        key_id=key_id, source_checksum=source_checksum, language__code=target_lang, origin="tm"
+    ).order_by("-version").only("text").first()
+    return tr.text if tr else None
+
+# API publique
+def create_or_update_key(*, scope: str, key_str: str, tenant_id: Optional[str] = None) -> TranslatableKey:
+    """Crée une clé sans texte source (Option B). Checksum mis à jour via Translation."""
+    obj, _ = TranslatableKey.objects.get_or_create(
+        scope=scope, key=key_str, defaults={"tenant_id": tenant_id, "checksum": ""}
+    )
+    return obj
+
+def store_translation(
+    *,
+    key: TranslatableKey,
+    target_lang: str,
+    translated_text: str,
+    source_text: str,
+    source_checksum: str,
+    origin: str = "llm",
+    reviewer: Optional[str] = None,
+    field: str = "text",
+    embedding_from_text: bool = EMBED_SYNC
+) -> Translation:
+    """Crée une nouvelle nouvelle version de traduction."""
+    from apps.faiss_pgvector.embeddings import encode_text  # Lazy import
+    language = get_active_language(target_lang)
+    latest_version = Translation.objects.filter(key=key, language=language).aggregate(v=Max("version"))["v"] or 0
+    emb_bytes = None
+    if embedding_from_text:
+        vec = encode_text(translated_text)  # list[float] ou np.ndarray
+        emb_bytes = np.asarray(vec, dtype=np.float32).tobytes()  # BinaryField
+    tr = Translation(
+        key=key,
+        language=language,
+        text=translated_text or "",
+        version=latest_version + 1,
+        reviewer=reviewer,
+        alerts=validate_seo_lengths(translated_text, source_text, field=field),
+        embedding=emb_bytes,
+        source_checksum=source_checksum,
+        origin=origin,
+        provider_info={"provider": "mistral", "model": "large-latest"},  # From LLM_ai
+        domain=key.scope.split(":")[0] if ":" in key.scope else None
+    )
+    tr.full_clean()
+    tr.save()
+    return tr
+
+def keys_qs(scope: str, tenant_id: Optional[str]) -> Iterable[TranslatableKey]:
+    """Filtre les clés par scope (support 'seo:*') et tenant_id."""
+    qs = TranslatableKey.objects.all()
+    if ":" in scope and scope.endswith("*"):
+        prefix = scope[:-1]
+        qs = qs.filter(scope__startswith=prefix)
+    else:
+        qs = qs.filter(scope=scope)
+    return qs.filter(tenant_id=tenant_id) if tenant_id else qs
+
+def batch_translate_scope(
+    *,
+    scope: str,
+    source_lang: Optional[str] = None,
+    target_langs: List[str],
+    tenant_id: Optional[str] = None,
+    chunk_size: int = BATCH_SIZE,
+    field: str = "text"
+) -> Dict[str, Union[int, List[str], Dict[str, int], Dict[str, int]]]:
+    """Traduit un scope vers plusieurs langues, avec TM et skip si checksum inchangé."""
+    from apps.LLM_ai.services import translate_text  # Lazy import
+    default_code = Language.objects.get_default()
+    src_lang = get_active_language(source_lang) if source_lang else get_active_language(default_code)
+    target_langs = [t.strip().lower().replace("_", "-") for t in target_langs]
+    target_langs = [t for t in target_langs if t != src_lang.code]
+    target_lang_objs = {t: get_active_language(t) for t in target_langs}
+
+    stats = {
+        "total_keys": 0,
+        "translated": 0,
+        "per_lang": {code: 0 for code in target_langs},
+        "origin_breakdown": {"tm": 0, "llm": 0},
+        "errors": [],
+        "skipped": 0,
+        "opts": {"provider": "mistral", "model": "large-latest"}
+    }
+    batch: List[Translation] = []
+
+    for key in keys_qs(scope, tenant_id).iterator(chunk_size=chunk_size):
+        stats["total_keys"] += 1
+        success_count = 0
+        try:
+            source_text = _get_source_text(key, src_lang)
+            if not source_text:
+                stats["skipped"] += 1
+                continue
+
+            checksum_now = compute_checksum(source_text)
+
+            for lang_code, lang_obj in target_lang_objs.items():
+                try:
+                    # Translation Memory lookup
+                    tm_text = tm_lookup(key.id, checksum_now, lang_code)
+                    if tm_text:
+                        batch.append(
+                            Translation(
+                                key=key,
+                                language=lang_obj,
+                                text=tm_text,
+                                version=(Translation.objects.filter(key=key, language=lang_obj).aggregate(v=Max("version"))["v"] or 0) + 1,
+                                alerts=validate_seo_lengths(tm_text, source_text, field=field),
+                                source_checksum=checksum_now,
+                                origin="tm",
+                                provider_info={"provider": "mistral", "model": "large-latest"},
+                                domain=key.scope.split(":")[0] if ":" in key.scope else None
+                            )
+                        )
+                        stats["translated"] += 1
+                        stats["per_lang"][lang_code] = stats["per_lang"].get(lang_code, 0) + 1
+                        stats["origin_breakdown"]["tm"] += 1
+                        success_count += 1
+                        continue
+
+                    # LLM translation
+                    translated = translate_text(
+                        source_text=source_text,
+                        source_lang=src_lang.code,
+                        target_lang=lang_code,
+                        prompt_template=key.prompt_template
+                    )
+                    vec = None
+                    if EMBED_SYNC:
+                        from apps.faiss_pgvector.embeddings import encode_text
+                        vec = encode_text(translated)
+                    batch.append(
+                        Translation(
+                            key=key,
+                            language=lang_obj,
+                            text=translated,
+                            version=(Translation.objects.filter(key=key, language=lang_obj).aggregate(v=Max("version"))["v"] or 0) + 1,
+                            alerts=validate_seo_lengths(translated, source_text, field=field),
+                            embedding=np.asarray(vec, dtype=np.float32).tobytes() if vec else None,
+                            source_checksum=checksum_now,
+                            origin="llm",
+                            provider_info={"provider": "mistral", "model": "large-latest"},
+                            domain=key.scope.split(":")[0] if ":" in key.scope else None
+                        )
+                    )
+                    stats["translated"] += 1
+                    stats["per_lang"][lang_code] = stats["per_lang"].get(lang_code, 0) + 1
+                    stats["origin_breakdown"]["llm"] += 1
+                    success_count += 1
+                except ValidationError as e:
+                    stats["errors"].append(f"{key.scope}:{key.key} | {lang_code} | {str(e)}")
+
+            if success_count:
+                key.checksum = checksum_now
+                key.save(update_fields=["checksum", "updated_at"])
+
+            if len(batch) >= chunk_size:
+                with transaction.atomic():
+                    Translation.objects.bulk_create(batch, ignore_conflicts=True, batch_size=chunk_size)
+                batch.clear()
+
+        except Exception as e:
+            stats["errors"].append(f"{key.scope}:{key.key} | * | {str(e)}")
+
+    if batch:
+        with transaction.atomic():
+            Translation.objects.bulk_create(batch, ignore_conflicts=True, batch_size=chunk_size)
+
+    return stats

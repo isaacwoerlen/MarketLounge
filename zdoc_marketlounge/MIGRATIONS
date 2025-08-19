@@ -1,0 +1,35 @@
+MIGRATIONS
+
+Oui, en local tu peux tout à fait supprimer ou remplacer les fichiers directement — c’est même souvent plus rapide pour restructurer ton app proprement. Mais voici quelques points à garder en tête pour éviter les pièges :
+________________________________________
+⚠️ Supprimer/remplacer les fichiers : ce qu’il faut savoir
+✅ Ce que tu peux faire sans souci
+•	Supprimer des fichiers Python inutilisés (views.py, forms.py, etc.)
+•	Réécrire complètement models.py, admin.py, apps.py, etc.
+•	Supprimer des fichiers JS/CSS liés à l’admin si tu refactores l’interface
+•	Réorganiser les dossiers (apps/language/, apps/glossary/, etc.)
+⚠️ Ce à quoi il faut faire attention
+•	Migrations Django : si tu modifies models.py, pense à supprimer les anciennes migrations et à en recréer une propre (makemigrations). Sinon, Django risque de planter ou de créer des migrations incohérentes.
+•	Base de données : si tu as déjà des données en local, les changements de modèle peuvent casser la structure. Tu peux : 
+o	Soit drop la DB et repartir de zéro (flush, reset, ou recréer la DB)
+o	Soit adapter les migrations pour faire évoluer proprement
+•	Imports croisés : si tu renommes des apps ou modules, vérifie que tous les imports sont à jour (INSTALLED_APPS, urls.py, settings.py, etc.)
+•	Celery / tâches planifiées : si tu modifies celery_app.py ou les tâches, assure-toi que le worker redémarre bien et que les tâches sont toujours reconnues.
+________________________________________
+🧼 Bonnes pratiques pour un reset propre
+# Supprimer les migrations existantes
+find . -path "*/migrations/*.py" -not -name "__init__.py" -delete
+find . -path "*/migrations/*.pyc"  -delete
+
+# Supprimer la base SQLite (si tu l’utilises)
+rm db.sqlite3
+
+# Recréer les migrations
+python manage.py makemigrations
+python manage.py migrate
+
+# Créer un superuser si besoin
+python manage.py createsuperuser
+________________________________________
+Tu veux que je t’aide à faire un reset propre de ton app language ou glossary ? Je peux te générer les commandes exactes selon ton stack.
+

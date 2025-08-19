@@ -1,0 +1,125 @@
+{% extends "admin/change_form.html" %}
+{% load i18n admin_urls static %}
+
+{% block content %}
+  <h1>
+    {% trans "Job" %} #{{ original.id|escape }} — {{ original.name|escape }}
+    <span data-job-id="{{ original.id|escape }}" aria-hidden="true"></span>
+  </h1>
+
+  <section aria-labelledby="details-heading">
+    <h2 id="details-heading">{% trans "Details" %}</h2>
+    <dl>
+      <dt>{% trans "Status" %}:</dt>
+      <dd class="language-admin status-{{ original.state|lower }}">{{ original.state|escape }}</dd>
+
+      <dt>{% trans "Source locale" %}:</dt>
+      <dd>{{ original.source_locale|escape }}</dd>
+
+      <dt>{% trans "Target locales" %}:</dt>
+      <dd>
+        {% for locale in original.target_locales %}
+          {{ locale|escape }}{% if not forloop.last %}, {% endif %}
+        {% empty %}
+          {% trans "None" %}
+        {% endfor %}
+      </dd>
+
+      <dt>{% trans "Created" %}:</dt>
+      <dd>{{ original.created_at|date:"SHORT_DATETIME_FORMAT"|escape }}</dd>
+
+      <dt>{% trans "Updated" %}:</dt>
+      <dd>{{ original.updated_at|date:"SHORT_DATETIME_FORMAT"|escape }}</dd>
+    </dl>
+  </section>
+
+  <section aria-labelledby="stats-heading">
+    <h2 id="stats-heading">{% trans "Statistics" %}</h2>
+    {% if original.stats %}
+      {{ original.stats|json_script:"job-stats" }}
+      <div class="language-admin stats-cards">
+        <div class="stat">
+          <strong>{% trans "Total keys" %}:</strong> {{ original.stats.total_keys|default:0|escape }}
+        </div>
+        <div class="stat">
+          <strong>{% trans "Translated" %}:</strong> {{ original.stats.translated|default:0|escape }}
+        </div>
+        <div class="stat">
+          <strong>{% trans "Skipped" %}:</strong> {{ original.stats.skipped|default:0|escape }}
+        </div>
+      </div>
+
+      <h3>{% trans "Per locale" %}</h3>
+      <table class="language-admin stats-table" role="table" aria-labelledby="stats-heading">
+        <thead>
+          <tr>
+            <th scope="col">{% trans "Locale" %}</th>
+            <th scope="col">{% trans "Translated" %}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for locale, count in original.stats.per_lang.items %}
+            <tr>
+              <td>{{ locale|escape }}</td>
+              <td>{{ count|default:0|escape }}</td>
+            </tr>
+          {% empty %}
+            <tr>
+              <td colspan="2">{% trans "No statistics available" %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+
+      {% if original.stats.origin_breakdown %}
+        <h3>{% trans "Origin" %}</h3>
+        <ul class="language-admin origin-list">
+          {% for origin, count in original.stats.origin_breakdown.items %}
+            <li>{{ origin|escape }}: {{ count|escape }}</li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+    {% else %}
+      <p>{% trans "No statistics available" %}</p>
+    {% endif %}
+  </section>
+
+  <section aria-labelledby="errors-heading">
+    <h2 id="errors-heading">{% trans "Errors" %}</h2>
+    {% if original.errors %}
+      <ul class="language-admin error-list">
+        {% for err in original.errors|slice:":10" %}
+          <li>{{ err|escape }}</li>
+        {% endfor %}
+      </ul>
+      {% if original.errors|length > 10 %}
+        <a href="{% url 'admin:language_translationjob_errors' original.id %}" aria-label="{% trans 'View all errors for job' %} #{{ original.id|escape }}">
+          {% trans "See all errors" %}
+        </a>
+      {% endif %}
+    {% else %}
+      <p>{% trans "No errors reported" %}</p>
+    {% endif %}
+  </section>
+
+  <section class="language-admin actions" aria-labelledby="actions-heading">
+    <h2 id="actions-heading">{% trans "Actions" %}</h2>
+    <form action="{% url 'admin:language_translationjob_rerun' original.id %}" method="post">
+      {% csrf_token %}
+      <button type="submit" class="button" data-task="rerun" aria-label="{% trans 'Rerun translation job' %} #{{ original.id|escape }}">
+        {% trans "Rerun Job" %}
+      </button>
+    </form>
+    <form action="{% url 'admin:language_translationjob_export' original.id %}" method="post">
+      {% csrf_token %}
+      <button type="submit" class="button" data-task="export" aria-label="{% trans 'Export translation job results as CSV' %} #{{ original.id|escape }}">
+        {% trans "Export CSV" %}
+      </button>
+    </form>
+  </section>
+
+{% endblock %}
+
+{% block extrastyle %}
+  <link rel="stylesheet" type="text/css" href="{% static 'language/language_admin.css' %}">
+{% endblock %}

@@ -46,10 +46,10 @@ services:
       timeout: 5s
       retries: 5
 
-  celery:
+  celery-worker:
     build: .
     restart: unless-stopped
-    command: celery -A marketlounge.celery_app worker -l info
+    command: celery -A config worker -l info
     volumes:
       - .:/app
       - logs_volume:/app/logs
@@ -62,7 +62,7 @@ services:
   celery-beat:
     build: .
     restart: unless-stopped
-    command: celery -A marketlounge.celery_app beat -l info
+    command: celery -A config beat -l info
     volumes:
       - .:/app
       - logs_volume:/app/logs

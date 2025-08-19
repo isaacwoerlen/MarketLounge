@@ -1,0 +1,128 @@
+# apps/language/tests/test_models.py
+import pytest
+from django.core.exceptions import ValidationError
+from django.db import IntegrityError
+from django.core.cache import cache
+from unittest.mock import patch
+from language.models import Language, TranslatableKey, Translation, TranslationJob
+from language.tests.factories import (
+    LanguageFactory,
+    TranslatableKeyFactory,
+    TranslationFactory,
+    TranslationJobFactory,
+)
+
+@pytest.mark.django_db
+class TestLanguage:
+    def test_language_code_normalization(self, clear_cache):
+        """Vérifie la normalisation du code langue (e.g., 'PT_br' -> 'pt-br')."""
+        lang = LanguageFactory(code="PT_br", name="Portuguese", is_active=True, priority=5)
+        lang.refresh_from_db()
+        assert lang.code == "pt-br"
+
+    def test_language_unique_code_constraint(self):
+        """Vérifie l'unicité du code langue."""
+        LanguageFactory(code="fr")
+        with pytest.raises(IntegrityError, match=r"unique_language_code"):
+            LanguageFactory(code="fr")
+
+    def test_language_default_implies_active_and_unique(self):
+        """is_default=True force is_active=True et désélectionne l'ancienne langue par défaut."""
+        fr = LanguageFactory(code="fr", is_active=False, is_default=True)
+        fr.refresh_from_db()
+        assert fr.is_active is True
+        en = LanguageFactory(code="en", is_active=True, is_default=True)
+        fr.refresh_from_db()
+        assert Language.objects.filter(is_default=True).count() == 1
+        assert en.is_default is True
+        assert fr.is_default is False
+
+    def test_language_manager_get_active_with_priority(self, clear_cache):
+        """get_active() retourne les langues actives, ordonnées par priority."""
+        fr = LanguageFactory(code="fr", is_active=True, priority=1)
+        en = LanguageFactory(code="en", is_active=True, priority=2)
+        LanguageFactory(code="de", is_active=False, priority=3)
+        result = Language.objects.get_active()
+        assert list(result) == ["fr", "en"]
+        assert cache.get("language:test:active") == ["fr", "en"]
+
+    def test_language_manager_get_default_fallback(self, clear_cache):
+        """get_default() retourne la langue par défaut ou la première active."""
+        Language.objects.all().delete()
+        fr = LanguageFactory(code="fr", is_active=True, priority=1)
+        assert Language.objects.get_default() == "fr"
+        en = LanguageFactory(code="en", is_active=True, is_default=True)
+        assert Language.objects.get_default() == "en"
+        Language.objects.all().delete()
+        assert Language.objects.get_default() == "en"  # Fallback settings.LANGUAGE_CODE
+
+@pytest.mark.django_db
+class TestTranslatableKey:
+    def test_translatablekey_unique_scope_key(self):
+        """Vérifie l'unicité de (scope, key)."""
+        TranslatableKeyFactory(scope="homepage", key="title")
+        with pytest.raises(IntegrityError, match=r"uniq_scope_key"):
+            TranslatableKeyFactory(scope="homepage", key="title")
+
+    def test_translatablekey_prompt_template_validation(self):
+        """Vérifie que prompt_template est un dict."""
+        key = TranslatableKeyFactory.build(prompt_template=["not_a_dict"])
+        with pytest.raises(ValidationError, match=r"must be a dict"):
+            key.full_clean()
+
+    def test_translatablekey_tenant_isolation(self):
+        """Vérifie l'isolation par tenant_id."""
+        key1 = TranslatableKeyFactory(tenant_id="tenant1", scope="homepage", key="title")
+        key2 = TranslatableKeyFactory(tenant_id="tenant2", scope="homepage", key="title")
+        assert TranslatableKey.objects.filter(tenant_id="tenant1").count() == 1
+        assert key1.pk != key2.pk
+
+@pytest.mark.django_db
+class TestTranslation:
+    def test_translation_version_check_constraint(self):
+        """Vérifie que version >= 1."""
+        key = TranslatableKeyFactory()
+        lang = LanguageFactory()
+        with pytest.raises(IntegrityError, match=r"translation_version_gte_1"):
+            Translation.objects.create(key=key, language=lang, text="t", version=0)
+
+    def test_translation_alerts_json_validation(self):
+        """Vérifie que alerts est une liste de dicts."""
+        tr = TranslationFactory.build(alerts=["not_a_dict"])
+        with pytest.raises(ValidationError, match=r"Alerts must be a list of dicts"):
+            tr.full_clean()
+
+    def test_translation_embedding_generation(self, mock_encode_text):
+        """Vérifie la génération d'embedding via signal."""
+        key = TranslatableKeyFactory()
+        lang = LanguageFactory()
+        with patch("language.signals.generate_embedding") as mock_signal:
+            tr = TranslationFactory(key=key, language=lang, text="Test")
+            mock_signal.assert_called_once_with(sender=Translation, instance=tr, created=True, **{})
+        assert tr.embedding == b"mocked_vector"
+
+    def test_translation_ordering_latest_first(self):
+        """Vérifie l'ordre par -updated_at, -version."""
+        key = TranslatableKeyFactory()
+        lang = LanguageFactory()
+        t1 = TranslationFactory(key=key, language=lang, version=1)
+        t2 = TranslationFactory(key=key, language=lang, version=2)
+        qs = Translation.objects.filter(key=key, language=lang)
+        assert list(qs.values_list("version", flat=True)) == [2, 1]
+
+@pytest.mark.django_db
+class TestTranslationJob:
+    def test_translationjob_json_field_formats(self):
+        """Vérifie les formats des JSONFields."""
+        job = TranslationJobFactory.build(target_locales="not_a_list")
+        with pytest.raises(ValidationError, match=r"Invalid JSON field formats"):
+            job.full_clean()
+
+    def test_translationjob_locales_validation(self, default_language):
+        """Vérifie la validation des locales contre get_active()."""
+        LanguageFactory(code="fr", is_active=True)
+        ok = TranslationJobFactory.build(source_locale="en", target_locales=["fr"])
+        ok.full_clean()
+        bad = TranslationJobFactory.build(source_locale="en", target_locales=["de"])
+        with pytest.raises(ValidationError, match=r"Invalid locales:.*de"):
+            bad.full_clean()

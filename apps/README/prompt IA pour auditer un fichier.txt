@@ -1,0 +1,9 @@
+Hier j'ai fait le script language/models.py. Aujourd'hui je veux faire services.py.
+Voici une version.
+
+Je voudrais que tu l'audites et me dises :
+- si c'est compliant avec les fichiers README
+- si le script est cohérent avec models.py
+- si a préparer bien le futur du projet (IA sémantique, scalabilité)
+- ce qu'on peut faire mieux 
+je ne veux pas de gadget ni de fioritures, je veux du lean, de l'efficace et du solide.

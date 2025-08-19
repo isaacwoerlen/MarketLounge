@@ -25,5 +25,9 @@ RUN python manage.py collectstatic --noinput
 # 🚀 Lancer Gunicorn
 CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000"]
 
-# Pouvoir utiliser dbshell
-RUN apt-get update && apt-get install -y postgresql-client
+# psycopg2-binary, pgvector
+RUN apt-get update && apt-get install -y \
+    postgresql-client \
+    libpq-dev \
+    postgresql-contrib \
+    && rm -rf /var/lib/apt/lists/*

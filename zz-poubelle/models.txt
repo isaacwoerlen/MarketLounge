@@ -1,163 +1,178 @@
-# apps/glossary/models.py
-import uuid
+# apps\transversales\language\models.py
 from django.db import models
 from django.core.exceptions import ValidationError
-from django.utils.text import slugify
-from django.conf import settings
-from django.utils import timezone
+from django.core.validators import RegexValidator
+from django.core.cache import cache
+from django.utils.translation import gettext_lazy as _
+from django.db.models import Q
 
-class GlossaryType(models.TextChoices):
-    METIER = "metier", "Métier"
-    OPERATION = "operation", "Opération"
-    VARIANTE = "variante", "Variante"
+# --- Cache ---
+LANG_CACHE_TTL = 60  # Configurable via settings si besoin
 
+def _ck(suffix: str) -> str:
+    """Fabrique de clés de cache (cohérente pour set + invalidation)."""
+    return f"language:{suffix}"
 
-class GlossaryNode(models.Model):
-    """
-    Source de vérité unique (Glossaire)
-    - glossary_id : identifiant canonique (stable, unique, indexé)
-    - node_id     : slug UX lisible (non unique, indexé) → chemins/URLs
-    - parent      : FK sur glossary_id du parent (contexte métier strict)
-    - labels/definition/procede/explication_technique/seo : JSON multilingue
-    - embedding   : JSON (phase 1), migrable vers pgvector plus tard
-    """
+# --- Validateur codes langue ---
+# ex. 'fr', 'en', 'pt-br' (normalisé en minuscule dans save())
+CODE_VALIDATOR = RegexValidator(
+    regex=r'^[a-z]{2}(-[a-z]{2})?$',
+    message="Code langue invalide (ex: 'fr', 'en', 'pt-br').",
+)
 
-    # Identifiants
-    glossary_id = models.CharField(max_length=64, unique=True, db_index=True)
-    node_id = models.SlugField(max_length=128, unique=False, db_index=True)
+# --- Manager ---
+class LanguageManager(models.Manager):
+    def get_default(self):
+        def _compute():
+            obj = (self.filter(is_default=True).first()
+                   or self.filter(is_active=True).order_by('priority', 'code').first())
+            return obj.code if obj else 'en'  # fallback minimal
+        return cache.get_or_set(_ck("default"), _compute, timeout=LANG_CACHE_TTL)
 
-    # Typage
-    type = models.CharField(max_length=16, choices=GlossaryType.choices)
+    def get_active(self):
+        def _compute():
+            return list(self.filter(is_active=True)
+                        .order_by('priority', 'code')
+                        .values_list('code', flat=True))
+        return cache.get_or_set(_ck("active"), _compute, timeout=LANG_CACHE_TTL)
 
-    # Parent par ID canonique (glossary_id)
-    parent = models.ForeignKey(
-        "self",
-        to_field="glossary_id",
-        db_column="parent_glossary_id",
-        null=True,
-        blank=True,
-        on_delete=models.SET_NULL,
-        related_name="children",
-    )
-
-    # Contexte (non identifiant)
-    path = models.CharField(max_length=512, db_index=True)
-
-    # Contenus multilingues (FR/EN requis; DE/IT faciles à ajouter)
-    labels = models.JSONField(default=dict, blank=True)                   # {"fr": "...", "en": "...", "de": "...", ...}
-    definition = models.JSONField(default=dict, blank=True)               # (metier, operation)
-    procede = models.JSONField(default=dict, blank=True)                  # (operation)
-    explication_technique = models.JSONField(default=dict, blank=True)    # (variante)
-    seo = models.JSONField(default=dict, blank=True)                      # {"fr": {"keywords":[...], "description":"..."}}
-
-    # Embedding par nœud (phase 1)
-    embedding = models.JSONField(null=True, blank=True)
-
-    # Gouvernance légère
+# --- Language ---
+class Language(models.Model):
+    code = models.CharField(max_length=10, unique=True, validators=[CODE_VALIDATOR])
+    name = models.CharField(max_length=100)
     is_active = models.BooleanField(default=True)
-    version = models.PositiveIntegerField(default=1)
-    alerts = models.JSONField(null=True, blank=True)  # ex: [{"type":"duplicate_node_id","detail":"..."}]
-
-    # Trace
-    created_at = models.DateTimeField(default=timezone.now)
+    is_default = models.BooleanField(default=False)
+    priority = models.IntegerField(default=5, db_index=True)  # 1 = haute priorité
+    created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    created_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, null=True, blank=True,
-        on_delete=models.SET_NULL, related_name="+"
-    )
-    reviewed_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, null=True, blank=True,
-        on_delete=models.SET_NULL, related_name="+"
-    )
+
+    # ✅ Micro-fix #1 : brancher le manager custom
+    objects = LanguageManager()
 
     class Meta:
-        indexes = [
-            models.Index(fields=["type"]),
-            models.Index(fields=["path"]),
-            models.Index(fields=["node_id"]),
+        constraints = [
+            models.UniqueConstraint(fields=['code'], name='unique_language_code'),
+            # is_default=True => doit être active
+            models.CheckConstraint(
+                check=Q(is_default=False) | Q(is_active=True),
+                name='default_lang_must_be_active',
+            ),
+            # ✅ Unicité de la langue par défaut (une seule True)
+            models.UniqueConstraint(
+                fields=['is_default'],
+                condition=Q(is_default=True),
+                name='unique_default_language_true',
+            ),
         ]
-        ordering = ["type", "glossary_id"]
+        indexes = [models.Index(fields=['is_active', 'priority'])]
 
-    # ───────── Validations métier ─────────
-    def clean(self):
-        if not self.node_id:
-            raise ValidationError("node_id est requis (slug snake_case).")
-
-        # Règles parentales
-        if self.type == GlossaryType.METIER:
-            if self.parent is not None:
-                raise ValidationError("Un 'metier' ne doit pas avoir de parent.")
-        elif self.type == GlossaryType.OPERATION:
-            if not self.parent or self.parent.type != GlossaryType.METIER:
-                raise ValidationError("Le parent d'une 'operation' doit être un 'metier'.")
-        elif self.type == GlossaryType.VARIANTE:
-            if not self.parent or self.parent.type != GlossaryType.OPERATION:
-                raise ValidationError("Le parent d'une 'variante' doit être une 'operation'.")
-
-        # Contenus requis/interdits par type
-        if self.type == GlossaryType.METIER:
-            if self._has_nonempty(self.procede):
-                raise ValidationError("Un 'metier' ne doit pas définir 'procede'.")
-            if self._has_nonempty(self.explication_technique):
-                raise ValidationError("Un 'metier' ne doit pas définir 'explication_technique'.")
-        if self.type == GlossaryType.OPERATION:
-            if not self._has_nonempty(self.definition):
-                raise ValidationError("Une 'operation' doit avoir une 'definition'.")
-            if not self._has_nonempty(self.procede):
-                raise ValidationError("Une 'operation' doit avoir un 'procede'.")
-            if self._has_nonempty(self.explication_technique):
-                raise ValidationError("Une 'operation' ne doit pas définir 'explication_technique'.")
-        if self.type == GlossaryType.VARIANTE:
-            if not self._has_nonempty(self.explication_technique):
-                raise ValidationError("Une 'variante' doit avoir une 'explication_technique'.")
-            if self._has_nonempty(self.definition):
-                raise ValidationError("Une 'variante' ne doit pas définir 'definition'.")
-            if self._has_nonempty(self.procede):
-                raise ValidationError("Une 'variante' ne doit pas définir 'procede'.")
-
-        # Anti‑cycle
-        if self.parent:
-            seen = {self.glossary_id}
-            p = self.parent
-            while p:
-                if p.glossary_id in seen:
-                    raise ValidationError("Cycle détecté dans la relation parent.")
-                seen.add(p.glossary_id)
-                p = p.parent
-
-        # Multilingue minimal requis
-        for lang in ("fr", "en"):
-            if not (self.labels or {}).get(lang):
-                raise ValidationError(f"labels.{lang} est requis.")
-
-        # SEO structure propre
-        if self.seo:
-            for lang, obj in self.seo.items():
-                if not isinstance(obj, dict):
-                    raise ValidationError(f"seo.{lang} doit être un objet.")
-                if "keywords" in obj and not isinstance(obj["keywords"], list):
-                    raise ValidationError(f"seo.{lang}.keywords doit être une liste.")
-
-    # ───────── Persistance ─────────
     def save(self, *args, **kwargs):
-        # Normalise le slug UX
-        self.node_id = slugify(self.node_id or (self.labels or {}).get("fr") or self.glossary_id or str(uuid.uuid4()))
-        # Recalcule le path
-        if self.parent:
-            base = self.parent.path or self.parent.node_id
-            self.path = f"{base}/{self.node_id}"
-        else:
-            self.path = self.node_id
-        # Initialise les JSON manquants
-        for key in ("labels", "definition", "procede", "explication_technique", "seo"):
-            if getattr(self, key) is None:
-                setattr(self, key, {})
+        # Normalisation lean
+        self.code = self.code.lower().replace('_', '-')
+        if self.is_default:
+            self.is_active = True
+            # Désélectionner les autres défauts
+            Language.objects.filter(is_default=True).exclude(pk=self.pk).update(is_default=False)
         super().save(*args, **kwargs)
-
-    # ───────── Utils ─────────
-    @staticmethod
-    def _has_nonempty(dct: dict) -> bool:
-        return bool(dct) and any(bool(v) for v in dct.values())
+        # ✅ Micro-fix #2 : invalidation des mêmes clés que celles utilisées par le manager
+        cache.delete_many([_ck("default"), _ck("active")])
 
     def __str__(self):
-        return f"{self.glossary_id} / {self.node_id} [{self.type}]"
+        return f"{self.name} ({self.code})"
+
+# --- TranslatableKey ---
+class TranslatableKey(models.Model):
+    scope = models.CharField(max_length=64, db_index=True)
+    key = models.CharField(max_length=255, db_index=True)
+    checksum = models.CharField(max_length=64, db_index=True, editable=False)
+    is_blocking = models.BooleanField(default=False)
+    prompt_template = models.JSONField(default=dict, blank=True)   # prêt pour LLM
+    tenant_id = models.CharField(max_length=36, null=True, blank=True, db_index=True)  # lean UUID string
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['scope', 'key'], name='uniq_scope_key'),
+        ]
+        indexes = [
+            models.Index(fields=['scope', 'key']),
+            models.Index(fields=['tenant_id']),
+        ]
+
+    def __str__(self):
+        return f"{self.scope} → {self.key}"
+
+# --- Translation ---
+class Translation(models.Model):
+    key = models.ForeignKey('TranslatableKey', on_delete=models.CASCADE, related_name='translations')
+    language = models.ForeignKey('Language', on_delete=models.PROTECT, db_index=True)
+    text = models.TextField()
+    version = models.IntegerField(default=1)
+    alerts = models.JSONField(default=list, blank=True)
+    reviewer = models.CharField(max_length=100, blank=True, null=True)  # Lean, pas de FK
+    embedding = models.BinaryField(null=True, blank=True)  # Prévoir faiss_pgvector
+    source_checksum = models.CharField(max_length=64, blank=True, default="")  # Checksum source
+    origin = models.CharField(max_length=16, choices=[("tm", "Translation Memory"), ("llm", "LLM")], default="llm")
+    provider_info = models.JSONField(default=dict, blank=True)  # e.g., {"provider": "mistral", "model": "large-latest"}
+    domain = models.CharField(max_length=32, blank=True, null=True, db_index=True)  # e.g., "seo", "ui"
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['key', 'language', 'version'], name='uniq_key_language_version'),
+            models.CheckConstraint(check=Q(version__gte=1), name='translation_version_gte_1'),
+        ]
+        indexes = [
+            models.Index(fields=['language']),
+            models.Index(fields=['key', 'language']),
+            models.Index(fields=['updated_at']),
+            models.Index(fields=['source_checksum']),
+            models.Index(fields=['domain']),
+        ]
+        ordering = ('-updated_at', '-version')
+
+    def clean(self):
+        if not isinstance(self.alerts, list) or any(not isinstance(x, dict) for x in self.alerts):
+            raise ValidationError(_('Alerts must be a list of dicts.'))
+        if not isinstance(self.provider_info, dict):
+            raise ValidationError(_('Provider_info must be a dict.'))
+        # Validation SEO déléguée à services.py
+
+    def __str__(self):
+        return f"[{self.language.code}] {self.key.key}"
+
+# --- TranslationJob ---
+class TranslationJob(models.Model):
+    name = models.CharField(max_length=255)
+    state = models.CharField(
+        max_length=16,
+        choices=[('queued', 'Queued'), ('running', 'Running'), ('done', 'Done'), ('failed', 'Failed')],
+        default='queued',
+        db_index=True,
+    )
+    source_locale = models.CharField(max_length=10, validators=[CODE_VALIDATOR])
+    target_locales = models.JSONField(default=list)
+    scope_filter = models.JSONField(default=list)  # Aligné avec README_language.md
+    stats = models.JSONField(default=dict)
+    errors = models.JSONField(default=list)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def clean(self):
+        if (not isinstance(self.target_locales, list)
+            or not isinstance(self.scope_filter, list)
+            or not isinstance(self.stats, dict)
+            or not isinstance(self.errors, list)):
+            raise ValidationError(_('Invalid JSON field formats.'))
+
+        active = Language.objects.get_active()
+        invalid_locales = [loc for loc in self.target_locales if loc not in active]
+        if invalid_locales:
+            raise ValidationError(f"Invalid locales: {invalid_locales}")
+        if self.source_locale not in active:
+            raise ValidationError(f"Invalid source locale: {self.source_locale}")
+
+    def __str__(self):
+        return f"{self.name} ({', '.join(self.target_locales)})"

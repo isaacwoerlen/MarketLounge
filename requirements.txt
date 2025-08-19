@@ -9,5 +9,5 @@ celery
 redis
 django-celery-beat
 sentence-transformers
-faiss-cpu  # Si utilisé pour les embeddings
-
+faiss-cpu  # utilisé pour les embeddings
+pgvector
