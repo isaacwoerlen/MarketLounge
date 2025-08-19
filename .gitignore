@@ -20,11 +20,12 @@ ENV/
 env/
 .venv/
 
-# 📄 README personnels
-zdoc_marketlounge/README*.md
 
-# 🛠️ Scripts utilitaires locaux
+# Répertoires à ignorer
+zdoc_marketlounge/
 zscripts_utilitaires/
+zz-poubelle/
+
 
 # 🐳 Docker
 *.npy
