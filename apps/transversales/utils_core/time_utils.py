@@ -1,165 +1,81 @@
-# utils_core/time_utils.py
-from __future__ import annotations
+from datetime import datetime, timezone
+from typing import Iterator
+from contextlib import contextmanager
+import time
+from dataclasses import dataclass
 
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Union
+@dataclass
+class Timer:
+    """A context manager to measure elapsed time."""
+    start: float = 0.0
+    elapsed_ms: float = 0.0
 
-__all__ = ["utc_now", "timestamp_ms", "format_duration", "parse_iso8601"]
+@contextmanager
+def timer() -> Iterator[Timer]:
+    """Context manager to measure elapsed time in milliseconds.
 
+    Yields:
+        Timer: An object with start time and elapsed time in milliseconds.
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Basics
-# ──────────────────────────────────────────────────────────────────────────────
+    Example:
+        with timer() as t:
+            time.sleep(1)
+        print(f"Operation took {t.elapsed_ms}ms")
+    """
+    t = Timer(start=time.perf_counter())
+    yield t
+    t.elapsed_ms = (time.perf_counter() - t.start) * 1000
 
 def utc_now() -> datetime:
-    """
-    Datetime 'aware' en UTC (précis à la microseconde).
+    """Return the current UTC datetime with timezone info.
+
+    Returns:
+        datetime: Current UTC datetime.
     """
     return datetime.now(timezone.utc)
 
+def timestamp_ms() -> int:
+    """Return the current timestamp in milliseconds.
 
-def timestamp_ms(dt: Optional[datetime] = None) -> int:
+    Returns:
+        int: Current timestamp in milliseconds since epoch.
     """
-    Millisecondes depuis l'époque UNIX.
-    - Si dt=None → now (UTC).
-    - Si dt est naïf → assumé UTC.
-    """
-    d = dt or utc_now()
-    if d.tzinfo is None:
-        d = d.replace(tzinfo=timezone.utc)
-    else:
-        d = d.astimezone(timezone.utc)
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    return int((d - epoch).total_seconds() * 1000)
+    return int(time.time() * 1000)
 
+def format_duration(seconds: float) -> str:
+    """Format duration in seconds to a human-readable string.
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Formatting
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _total_seconds(value: Union[float, int, timedelta]) -> float:
-    if isinstance(value, timedelta):
-        return value.total_seconds()
-    return float(value)
-
-def format_duration(
-    value: Union[float, int, timedelta],
-    *,
-    precision: int = 2,
-    short: bool = False,
-) -> str:
-    """
-    Formate une durée de façon lisible.
-    Règles:
-      - ≥ 1h  → 'Hh Mm Ss' (omit composants nuls, s avec décimales)
-      - ≥ 1m  → 'Mm Ss'
-      - ≥ 1s  → 'S.s s'
-      - ≥ 1ms → 'X ms'
-      - sinon → 'X µs'
     Args:
-        value: secondes (float/int) ou timedelta.
-        precision: décimales pour la partie secondes.
-        short: si True, sans espaces ('1h2m3.45s' au lieu de '1h 2m 3.45s').
+        seconds: Duration in seconds.
+
+    Returns:
+        str: Formatted duration (e.g., '1h 30m 45s').
     """
-    secs = _total_seconds(value)
-    sign = "-" if secs < 0 else ""
-    s = abs(secs)
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs or not parts:
+        parts.append(f"{secs:.2f}s")
+    return " ".join(parts)
 
-    sep = "" if short else " "
-    parts: list[str] = []
+def parse_iso8601(iso_str: str) -> datetime:
+    """Parse an ISO 8601 string to a datetime object.
 
-    if s >= 3600:
-        h = int(s // 3600)
-        s -= h * 3600
-        m = int(s // 60)
-        s -= m * 60
-        if h:
-            parts.append(f"{h}h")
-        if m:
-            parts.append(f"{m}m")
-        parts.append(f"{s:.{precision}f}s" if precision > 0 else f"{int(round(s))}s")
-        return sign + sep.join(parts)
+    Args:
+        iso_str: ISO 8601 formatted string (e.g., '2023-10-01T12:00:00Z').
 
-    if s >= 60:
-        m = int(s // 60)
-        s -= m * 60
-        parts.append(f"{m}m")
-        parts.append(f"{s:.{precision}f}s" if precision > 0 else f"{int(round(s))}s")
-        return sign + sep.join(parts)
+    Returns:
+        datetime: Parsed datetime object.
 
-    if s >= 1:
-        return sign + (f"{s:.{precision}f}s" if precision > 0 else f"{int(round(s))}s")
-
-    # < 1s → ms / µs
-    ms = s * 1_000
-    if ms >= 1:
-        # éviter -0.00
-        val = f"{ms:.{max(0, precision)}f}".rstrip("0").rstrip(".")
-        return f"{sign}{val}{'' if short else ' '}ms"
-
-    us = s * 1_000_000
-    val = f"{us:.0f}"
-    return f"{sign}{val}{'' if short else ' '}µs"
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Parsing
-# ──────────────────────────────────────────────────────────────────────────────
-
-def parse_iso8601(
-    value: Union[str, datetime, int, float],
-    *,
-    default_tz: timezone = timezone.utc,
-    naive_policy: str = "assume_utc",  # "assume_utc" | "attach_default" | "error"
-) -> datetime:
+    Raises:
+        ValueError: If the string is not a valid ISO 8601 format.
     """
-    Parse ISO-8601 (tolérant) → datetime *aware*.
-    Accepte:
-      - str: '2025-08-18T10:15:30Z', '2025-08-18 10:15:30+02:00', '2025-08-18T10:15:30.123456'
-      - datetime: si naïf → selon naive_policy
-      - int/float: timestamp (secondes UNIX)
-
-    naive_policy:
-      - "assume_utc"   → naïf interprété comme UTC (replace tzinfo=UTC)
-      - "attach_default" → attache default_tz sans conversion
-      - "error"        → lève ValueError si naïf
-    """
-    # datetime direct
-    if isinstance(value, datetime):
-        dt = value
-        if dt.tzinfo is None:
-            if naive_policy == "assume_utc":
-                return dt.replace(tzinfo=timezone.utc)
-            if naive_policy == "attach_default":
-                return dt.replace(tzinfo=default_tz)
-            raise ValueError("Naive datetime not allowed (naive_policy='error').")
-        return dt.astimezone(default_tz) if default_tz else dt
-
-    # timestamp numérique (secondes)
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc)
-
-    s = str(value).strip()
-    if not s:
-        raise ValueError("Empty ISO-8601 string")
-
-    # Support 'Z' → '+00:00'
-    if s.endswith("Z") or s.endswith("z"):
-        s = s[:-1] + "+00:00"
-
-    # Autoriser espace comme séparateur date/heure
-    s = s.replace(" ", "T", 1) if " " in s and "T" not in s else s
-
     try:
-        dt = datetime.fromisoformat(s)
-    except Exception as e:
-        raise ValueError(f"Invalid ISO-8601 datetime: {value!r} ({e})")
-
-    if dt.tzinfo is None:
-        if naive_policy == "assume_utc":
-            dt = dt.replace(tzinfo=timezone.utc)
-        elif naive_policy == "attach_default":
-            dt = dt.replace(tzinfo=default_tz)
-        else:
-            raise ValueError("Naive datetime not allowed (naive_policy='error').")
-    return dt
+        return datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    except ValueError as e:
+        raise ValueError(f"Invalid ISO 8601 format: {iso_str}") from e

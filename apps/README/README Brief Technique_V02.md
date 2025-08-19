@@ -28,6 +28,13 @@ Objectif : Enrichissements sémantiques via LLM (Mistral, OpenAI).
 Fonctionnement : Génère résumés, suggestions ; expose API interne.
 Intégration : Utiliser helpers dans services.py/tasks.py des verticales.
 
+🔍 matching
+
+Objectif : Matching runtime hybrid (lexical + vectoriel) avec vectorisation/recherche sémantique.
+Dépendances : LLM_ai, taxonomy.
+Fonctionnement : Encode via sentence-transformers ; stocke vecteurs pgvector ; index FAISS (.index) ; rerank via LLM ; cache résultats Redis.
+Intégration : Helpers (encode_text, store_vector, search_similar) ; synchronise index via Celery.
+
 📸 media
 
 Objectif : Gestion multimédias (images, vidéos, documents).
@@ -62,7 +69,7 @@ Intégration : Importer dans verticales/transverses.
 📖 glossary
 
 Objectif : Structurer savoir-faire industriels (définitions, termes).
-Dépendances : language, seo, LLM_ai, media, taxonomy, matching.
+Dépendances : language, seo, LLM_ai, media, taxonomy.
 Fonctionnement : Gère termes avec définitions, traductions, SEO ; utilise matching pour recherches sémantiques.
 Intégration : Modèles avec SEOblock ; traduction via language ; vectorisation via matching.
 
@@ -87,12 +94,7 @@ Dépendances : language, matching, taxonomy, metrics.
 Fonctionnement : Création/recherche offres ; utilise matching pour recommandations ; croise offre/demande.
 Intégration : Recherche via matching ; suivi via metrics.
 
-🔍 matching
 
-Objectif : Matching runtime hybrid (lexical + vectoriel) avec vectorisation/recherche sémantique.
-Dépendances : LLM_ai, taxonomy.
-Fonctionnement : Encode via sentence-transformers ; stocke vecteurs pgvector ; index FAISS (.index) ; rerank via LLM ; cache résultats Redis.
-Intégration : Helpers (encode_text, store_vector, search_similar) ; synchronise index via Celery.
 
 🗂️ curation
 
